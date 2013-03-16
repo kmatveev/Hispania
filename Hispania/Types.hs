@@ -123,36 +123,16 @@ defaultReason 302 = BS.pack "Moved temporary"
 
 
 
-
-data DialogKey = DialogKey BS.ByteString BS.ByteString BS.ByteString
-
-data ProxyKey = ProxyKey BS.ByteString
-
-
-
-data UAContext = UAContext {localAddr::SipAddress, callIdVal::BS.ByteString}
-
-type ResponseHandler = Request () -> ()
-
-data ClientContext = ClientContext {remoteAddr::SipAddress, clientUA::UAContext, responseHandler::ResponseHandler, requestPrototype::Request ()}
-
-
-
 data ClientTranKey = ClientTranKey RequestMethod BS.ByteString deriving (Eq, Ord, Show)
 
 getClientTranKey :: (Message a) => a -> Maybe ClientTranKey
 getClientTranKey message = (getTopHeader message (BS.pack "Via")) >>= toVia >>= (Just . viaParams) >>= (getParam (BS.pack "branch")) >>= (Just . ClientTranKey (getMethod message))
 
+data ServerTranKey = ServerTranKey RequestMethod BS.ByteString deriving (Eq, Ord, Show)
+
+getServerTranKey :: (Message a) => a -> Maybe ServerTranKey
+getServerTranKey message = (getTopHeader message (BS.pack "Via")) >>= toVia >>= (Just . viaParams) >>= (getParam (BS.pack "branch")) >>= (Just . ServerTranKey (getMethod message))
 
 
-data ClientTransaction = InviteClientTransaction InviteClientTranState ClientContext | NonInviteClientTransaction NonInviteClientTranState ClientContext
 
-data InviteClientTranState = ICInitial | ICCalling | ICProceeding | ICCompleted | ICTerminated
 
-data NonInviteClientTranState = NICInitial | NICTrying | NICProceeding | NICCompleted | NICTerminated
-
-data ServerTransaction = InviteServerTransaction | NonInviteServerTransaction
-
-data NonInviteServerTranState = NISInitial | NISTrying | NISProceeding | NISCompleted | NISTerminated
-
-data InviteServerTranState = ISInitial | ISProceeding | ISCompleted | ISConfirmed | ISTerminated

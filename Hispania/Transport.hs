@@ -77,22 +77,22 @@ receive transportLayer =
       sock  = snd entry
       local = fst entry
 
-getSocket :: Transport -> Direction -> TransportLayer -> IO (Socket, TransportLayer)
+getSocket :: Transport -> Direction -> TransportLayer -> IO (Socket, Maybe TransportLayer)
 
 getSocket TCP direction transportLayer = case existing of
-                                           Just socket -> return (socket, transportLayer)
+                                           Just socket -> return (socket, Just transportLayer)
                                            Nothing -> error "not found"
    where
       existing = getExistingForOut direction (poolTCP transportLayer)
 
 getSocket UDP direction transportLayer = case existing of
-                                          Just socket -> return (socket, transportLayer)
+                                          Just socket -> return (socket, Just transportLayer)
                                           Nothing -> error "not found"
     where
       existing = getExistingForOut direction (poolUDP transportLayer)
 
 
-sendRawTo :: BS.ByteString -> Direction -> Transport -> TransportLayer -> IO TransportLayer
+sendRawTo :: BS.ByteString -> Direction -> Transport -> TransportLayer -> IO (Maybe TransportLayer)
 sendRawTo bytes direction transport transportLayer =
          let remote = (destination direction) in
          do
@@ -102,10 +102,10 @@ sendRawTo bytes direction transport transportLayer =
            return updatedTransportLayer
 
 
-getSocketForOut transportLayer poolAccess direction = fromJust existing 
-   where
-     pool = poolAccess transportLayer
-     existing = getExistingForOut direction pool
+-- getSocketForOut transportLayer poolAccess direction = fromJust existing 
+--   where
+--     pool = poolAccess transportLayer
+--     existing = getExistingForOut direction pool
 
 getPort :: SockAddr -> Word16
 getPort (SockAddrInet (PortNum port) host) = port

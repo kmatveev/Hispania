@@ -1,4 +1,8 @@
-module Hispania.Stack where
+module Hispania.Stack ( 
+  Stack(..), newStack, maybeUpdateTransport,
+  RequestHandler, ResponseHandler, ServerContext, ClientContext(..), serveOne, serveLoop,
+  createRequest, sendRequest, sendReq, respond, respondTo, createUAContext, createClientContext
+) where
 
 import Hispania.Types
 import Hispania.Parser
@@ -14,6 +18,7 @@ import Network.Socket.ByteString
 import Network.BSD
 import qualified Data.Attoparsec.ByteString as ATP
 import qualified Data.Attoparsec.ByteString.Char8 as ATPC
+import System.IO
 
 
 import Control.Monad.State
@@ -25,7 +30,7 @@ echoPort = 9900
 
 data Stack = Stack {
        transportLayer::TransportLayer, 
-       requestHandler::RequestHandler, 
+       initialRequestHandler::RequestHandler, 
        generatorVal::Word, 
        clientTranMap :: ClientTranMap, 
        serverTranMap :: ServerTranMap, 
@@ -33,18 +38,28 @@ data Stack = Stack {
        proxyMap :: ProxyMap
 }
 
-updateTransport :: (TransportLayer -> TransportLayer) -> Stack -> Stack
-updateTransport f stack = (liftM7 Stack (f . transportLayer) requestHandler generatorVal clientTranMap serverTranMap dialogMap proxyMap) stack
 
+maybeUpdateTransport :: (Maybe TransportLayer) -> Stack -> Stack
+maybeUpdateTransport mbUpdatedTransportLayer stack = maybe stack (\tl -> stack{transportLayer = tl}) mbUpdatedTransportLayer
 
 updateGenerator :: Word -> Stack -> Stack
-updateGenerator gen stack = (liftM7 Stack transportLayer requestHandler (return gen) clientTranMap serverTranMap dialogMap proxyMap) stack
+updateGenerator gen stack = (liftM7 Stack transportLayer initialRequestHandler (return gen) clientTranMap serverTranMap dialogMap proxyMap) stack
 
 updateClientTran :: (ClientTranKey, ClientTransaction) -> Stack -> Stack
-updateClientTran (key, val) stack = (liftM7 Stack transportLayer requestHandler generatorVal ((Map.insert key val) . clientTranMap) serverTranMap dialogMap proxyMap) stack
+updateClientTran (key, val) stack = (liftM7 Stack transportLayer initialRequestHandler generatorVal ((Map.insert key val) . clientTranMap) serverTranMap dialogMap proxyMap) stack
 
 updateClientTranMap :: ClientTranMap -> Stack -> Stack
 updateClientTranMap updatedTranMap stack = stack{clientTranMap=updatedTranMap}
+
+
+insertServerTran :: ServerTranKey -> ServerTransaction -> Stack -> Stack
+insertServerTran key tran stack = let updatedServerTranMap = Map.insert key tran (serverTranMap stack) in
+                                  stack{serverTranMap=updatedServerTranMap}
+
+
+removeServerTran :: ServerTranKey -> Stack -> Stack
+removeServerTran key stack = let updatedServerTranMap = Map.delete key (serverTranMap stack) in
+                             stack{serverTranMap = updatedServerTranMap}
 
 
 newStack :: RequestHandler -> Stack
@@ -52,29 +67,67 @@ newStack reqHandler = Stack clearTransportLayer reqHandler 0 Map.empty Map.empty
 
 type ClientTranMap = Map.Map ClientTranKey ClientTransaction
 
-type ServerTranMap = Map.Map BS.ByteString ServerTransaction
+type ServerTranMap = Map.Map ServerTranKey ServerTransaction
 
 type DialogMap = Map.Map DialogKey Dialog
 
 type ProxyMap = Map.Map ProxyKey Proxy
 
-getClientContext :: ClientTransaction -> ClientContext
-getClientContext (InviteClientTransaction state clientCtx) = clientCtx
-getClientContext (NonInviteClientTransaction state clientCtx) = clientCtx
-
 data Dialog = Dialog
 
 data Proxy = Proxy
 
-data ServerContext = ServerContext Stack Direction Transport RequestHandler
+-- class Context a where
+--   extractStack :: a -> Stack
 
-class Context a where
-  extractStack :: a -> Stack
+-- instance Context ServerContext where
+--   extractStack (ServerContext stack _ _ _ _) = stack
 
-instance Context ServerContext where
-  extractStack (ServerContext stack _ _ _) = stack
 
-getRequestHandler (ServerContext _ _ _ reqHandler) = reqHandler
+
+
+
+data ClientTransaction = InviteClientTransaction InviteClientTranState ClientContext | NonInviteClientTransaction NonInviteClientTranState ClientContext
+
+data InviteClientTranState = ICInitial | ICCalling | ICProceeding | ICCompleted | ICTerminated
+
+data NonInviteClientTranState = NICInitial | NICTrying | NICProceeding | NICCompleted | NICTerminated
+
+data ServerTransaction = InviteServerTransaction InviteServerTranState ServerContext | NonInviteServerTransaction NonInviteServerTranState ServerContext
+
+data NonInviteServerTranState = NISInitial | NISTrying | NISProceeding | NISCompleted | NISTerminated
+
+data InviteServerTranState = ISInitial | ISProceeding | ISCompleted | ISConfirmed | ISTerminated
+
+isTerminatedState:: ServerTransaction -> Bool
+isTerminatedState (InviteServerTransaction ISTerminated _)     = True
+isTerminatedState (InviteServerTransaction _ _)                = False
+isTerminatedState (NonInviteServerTransaction NISTerminated _) = True
+isTerminatedState (NonInviteServerTransaction _ _)             = False
+
+getClientContext :: ClientTransaction -> ClientContext
+getClientContext (InviteClientTransaction state clientCtx) = clientCtx
+getClientContext (NonInviteClientTransaction state clientCtx) = clientCtx
+
+
+data ClientContext = ClientContext {remoteAddr::SipAddress, clientUA::UAContext, responseHandler::ResponseHandler, requestPrototype::Request ()}
+
+data ServerContext = ServerContext {servingStack::Stack, servingDirection::Direction, servingTransport::Transport, servingHandler::RequestHandler, serverTran::ServerTransaction, serverTranKey::ServerTranKey}
+
+
+data DialogKey = DialogKey BS.ByteString BS.ByteString BS.ByteString
+
+data ProxyKey = ProxyKey BS.ByteString
+
+
+
+data UAContext = UAContext {localAddr::SipAddress, callIdVal::BS.ByteString}
+
+type ResponseHandler = Request () -> ()
+
+
+
+type StackTask = Stack -> IO Stack
 
 
 serveLoop :: Stack -> IO ()
@@ -82,17 +135,19 @@ serveLoop origStack = do
            updatedStack <- serveOne origStack
            serveLoop updatedStack
 
-serveOne :: Stack -> IO Stack
+serveOne :: StackTask
 serveOne origStack = do
            (mesg, direction, transport) <- receive (transportLayer origStack)
            putStrLn ("Received message " ++ (show direction))
-           handle mesg origStack direction transport
+           newStack <- handle mesg direction transport origStack 
+           hFlush stdout
+           return newStack
 
 
 
-handle :: BS.ByteString -> Stack -> Direction -> Transport -> IO Stack
-handle bytes stack direction transport = case parseResult of
-                                           ATPC.Done _ (Right request) -> handleRequest request (ServerContext stack direction transport (requestHandler stack)) stack
+handle :: BS.ByteString ->  Direction -> Transport -> StackTask
+handle bytes direction transport stack = case parseResult of
+                                           ATPC.Done _ (Right request) -> handleRequest request direction transport stack
                                            ATPC.Done _ (Left response) -> handleResponse response stack
                                            ATPC.Fail _ _ errorStr -> error  ("Failed to parse:" ++ errorStr)
                                            ATPC.Partial _ -> error "Parsed only partially"
@@ -100,9 +155,38 @@ handle bytes stack direction transport = case parseResult of
                          parseResult = ATPC.parse messageParser bytes
 
 
-handleRequest :: Request () -> ServerContext -> Stack -> IO Stack
-handleRequest request serverCtx stack = (getRequestHandler serverCtx) request serverCtx stack
+handleRequest :: Request () -> Direction -> Transport -> StackTask
+handleRequest request direction transport stack = 
+     case (getServerTranKey request) of
+       Nothing            -> return stack
+       Just serverTranKey -> case (Map.lookup serverTranKey (serverTranMap stack)) of 
+                               Nothing         -> reqHandler request serverCtx (insertServerTran serverTranKey createdServerTran stack)
+                                                    where
+                                                       serverCtx = ServerContext stack direction transport reqHandler createdServerTran serverTranKey
+                                                       reqHandler = initialRequestHandler stack
+                                                       createdServerTran = case (reqMethod request) of
+                                                                             INVITE -> InviteServerTransaction ISInitial serverCtx
+                                                                             _      -> NonInviteServerTransaction NISInitial serverCtx 
 
+                               Just serverTran -> serverTranSMProcessReq serverTran request stack
+
+serverTranSMProcessReq :: ServerTransaction -> Request () -> StackTask
+
+serverTranSMProcessReq (NonInviteServerTransaction state _) req stack = 
+    case state of
+      NISInitial    -> putStrLn "retransmit" >> return stack
+      NISTrying     -> putStrLn "retransmit" >> return stack
+      NISProceeding -> putStrLn "retransmit" >> return stack
+      NISCompleted  -> putStrLn "retransmit" >> return stack
+      NISTerminated -> putStrLn "retransmit" >> return stack
+
+serverTranSMProcessReq (InviteServerTransaction state _) req stack = 
+    case state of
+      ISInitial    -> putStrLn "retransmit" >> return stack
+      ISProceeding -> putStrLn "retransmit" >> return stack
+      ISCompleted  -> putStrLn "retransmit" >> return stack
+      ISConfirmed  -> putStrLn "retransmit" >> return stack
+      ISTerminated -> putStrLn "retransmit" >> return stack
 
 handleResponse :: Response () -> Stack -> IO Stack
 handleResponse res stack = case clientTranResult of
@@ -111,29 +195,76 @@ handleResponse res stack = case clientTranResult of
                                                  return (responseHandler (getClientContext clientTran))
                                                  return stack
   where
-    clientTranKey = fromJust (getClientTranKey res)
-    clientTranResult = Map.lookup clientTranKey (clientTranMap stack)
-    
+    clientTranResult = getClientTranKey res >>= (\key -> Map.lookup key (clientTranMap stack))
 
-type RequestHandler = Request () -> ServerContext -> Stack -> IO Stack
 
-respond :: ServerContext -> Response () -> Stack -> IO Stack
-respond serverCtx response stack = do
-       updatedTransportLayer <- sendResponseTo response respDirection transport (transportLayer stack)
-       return (updateTransport (\_ -> updatedTransportLayer) stack)
+clientTranSMProcessRes :: ClientTransaction -> Request () -> StackTask
+
+clientTranSMProcessRes (NonInviteClientTransaction state _) req stack = 
+    case state of
+      NICInitial    -> return stack
+      NICTrying     -> return stack
+      NICProceeding -> return stack
+      NICCompleted  -> return stack
+      NICTerminated -> return stack
+
+clientTranSMProcessRes (InviteClientTransaction state _) req stack = 
+    case state of
+      ICCalling    -> return stack
+      ICProceeding -> return stack
+      ICCompleted  -> return stack
+      ICTerminated -> return stack
+
+
+type RequestHandler = Request () -> ServerContext -> StackTask
+
+respond :: ServerContext -> Response () -> StackTask
+respond serverCtx response stack = case responseAction of
+                                     SendResponseOnce -> sendTask stack >>= (return . updateServerTran)
+                                     ResponseError    -> (return . updateServerTran) stack
+                                     SkipResponse     -> (return . updateServerTran) stack
    where
-      (ServerContext stack direction transport _) = serverCtx
+      (ServerContext stack direction transport _ tran key) = serverCtx
       respDirection = calcDirectionForResponse transport direction
+      (mbTranUpdate, responseAction) = serverTranSMProcessRes tran response
+      sendTask s = do
+                     mbUpdatedTransportLayer <- sendResponseTo response respDirection transport (transportLayer s)
+                     return (maybeUpdateTransport mbUpdatedTransportLayer s)
+      updateServerTran = maybe id (\trn -> if (isTerminatedState trn) then (removeServerTran key) else (insertServerTran key trn)) mbTranUpdate
+                                       
+
+
+data ResponseAction = SendResponseOnce | SendResponsePeriodically | SkipResponse | ResponseError
+
+serverTranSMProcessRes :: ServerTransaction -> Response () -> (Maybe ServerTransaction, ResponseAction)
+
+serverTranSMProcessRes (NonInviteServerTransaction state serverCtx) res = 
+    case state of
+      NISInitial    -> ( Just (NonInviteServerTransaction NISTrying serverCtx), SendResponseOnce)
+      NISTrying     -> ( Just (NonInviteServerTransaction NISProceeding serverCtx), SendResponseOnce)
+      NISProceeding -> ( Just (NonInviteServerTransaction NISCompleted serverCtx), SendResponseOnce)
+      NISCompleted  -> ( Nothing, ResponseError )
+      NISTerminated -> ( Nothing, ResponseError )
+
+serverTranSMProcessRes (InviteServerTransaction state serverCtx) res = 
+    case state of
+      ISInitial    -> ( Just (InviteServerTransaction ISProceeding serverCtx), SendResponseOnce)
+      ISProceeding -> ( Just (InviteServerTransaction ISTerminated serverCtx), SendResponseOnce)
+      ISCompleted  -> ( Nothing, ResponseError )
+      ISConfirmed  -> ( Nothing, ResponseError )
+      ISTerminated -> ( Nothing, ResponseError )
+
+
 
 
 calcDirectionForResponse :: Transport -> Direction -> Direction
 calcDirectionForResponse TCP reqDirection = reverseDirection reqDirection
 calcDirectionForResponse UDP reqDirection = Direction (fromJust (source reqDirection), Nothing)
 
-sendRequestTo :: Request () -> Direction -> Transport -> TransportLayer -> IO TransportLayer
+sendRequestTo :: Request () -> Direction -> Transport -> TransportLayer -> IO (Maybe TransportLayer)
 sendRequestTo =  sendRawTo . toByteString . requestBuilder2
 
-sendResponseTo :: Response () -> Direction -> Transport -> TransportLayer -> IO TransportLayer 
+sendResponseTo :: Response () -> Direction -> Transport -> TransportLayer -> IO (Maybe TransportLayer)
 sendResponseTo = sendRawTo . toByteString . responseBuilder2
 
 
@@ -179,8 +310,8 @@ getDirection req = do
 sendRequest :: ResponseHandler -> Request () -> Stack -> IO Stack
 sendRequest handler req stack = do
               (direction, transport) <- getDirection req
-              updatedTransportLayer <- sendRequestTo req direction transport (transportLayer stack)
-              return (updateTransport (\_ -> updatedTransportLayer) stack)
+              mbUpdatedTransportLayer <- sendRequestTo req direction transport (transportLayer stack)
+              return (maybeUpdateTransport mbUpdatedTransportLayer stack)
 
 
 createRequest :: RequestMethod -> URI -> URI -> Stack -> (Request (), Stack)
@@ -219,13 +350,13 @@ sendReq :: Request () -> (ClientContext, Stack) -> IO Stack
 sendReq req (clientCtx, stack) = 
             do
               (direction, transport) <- getDirection req
-              (sock, updatedTransportLayer) <- getSocket transport direction (transportLayer stack)
+              (sock, mbUpdatedTransportLayer) <- getSocket transport direction (transportLayer stack)
               localAddr <- getSocketName sock
               sent_len <- let updatedReq = (prependHeader req (generateVia localAddr transport branchByteStr)) in
                           let remote = destination direction in
                           let bytes = toByteString (requestBuilder2 updatedReq) in
                           sendTo sock bytes remote
-              return (updateTransport (\_ -> updatedTransportLayer) stackWithStoredTransaction)
+              return (maybeUpdateTransport mbUpdatedTransportLayer stackWithStoredTransaction)
     where
        (generatedBranch, newGenVal) = nextVal (generatorVal stack)
        branchByteStr = packThem generatedBranch

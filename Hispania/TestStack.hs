@@ -9,45 +9,141 @@ import Hispania.TestTypes
 
 import Data.ByteString.Char8 as BS
 import Network.BSD
-import Network.Socket
+import Network.Socket hiding (send, sendTo, recv, recvFrom)
+import Network.Socket.ByteString
 
 import Data.Maybe
+import Data.Word
 import qualified Data.Map as Map
 
 import System.IO.Unsafe
+import System.IO
+
+-- |-------------------------------------------------------------
+-- |
+-- | Common part: configuration
+-- |
+-- |-------------------------------------------------------------
+
+data TestConfig = TestConfig{ testLocalPort::PortNumber, testRemotePort::PortNumber, testTransport::Transport}
+
+defaultConfig = TestConfig (fromIntegral localPort) (fromIntegral remotePort) UDP
+
+localPort  = 5657
+remotePort = 5698
+
+
+-- |-------------------------------------------------------------
+-- |
+-- | Common part: test framework, initial request handlers.
+-- |
+-- |-------------------------------------------------------------
 
 simpleResponder :: RequestHandler
 simpleResponder req serverCtx = respond serverCtx response
   where
     response = respondTo req 200
 
+printingHandler :: RequestHandler
+printingHandler req serverCtx stack = do
+                                       System.IO.putStrLn "Received request"
+                                       hFlush stdout
+                                       return stack
 
-testServer = start (newStack simpleResponder)
+data TestEnv = TestEnv {localSock::Socket, localSockAddr::SockAddr, remoteSock::Socket, remoteSockAddr::SockAddr, testedStack::Stack}
 
-testReqURI = (RawURI (BS.pack "sip") (BS.pack "127.0.0.1") )
+prepareTest :: TestConfig -> RequestHandler -> IO TestEnv
+prepareTest config handler = do
+                       localSock <- socket AF_INET Datagram 0
+                       localHostAddr <- inet_addr localHostName
+                       let localSockAddr = (SockAddrInet (testLocalPort config) localHostAddr)
+                       bindSocket localSock localSockAddr
+                       remoteSock <- socket AF_INET Datagram 0
+                       remoteHostAddr <- inet_addr localHostName
+                       let remoteSockAddr = (SockAddrInet (testRemotePort config) remoteHostAddr)
+                       bindSocket remoteSock remoteSockAddr
+                       let cleanStack = newStack handler
+                       let initializedStack = cleanStack{transportLayer = (addSocketUDP localSockAddr localSock (transportLayer cleanStack))}
+                       return (TestEnv localSock localSockAddr remoteSock remoteSockAddr initializedStack)
+    where
+       remoteHostName = "127.0.0.1"
+       localHostName = "127.0.0.1"
+       message = incomingRegisterStr
 
-testOutgoingReq = Request INVITE testReqURI defaultProtoVersion [testFrom, testTo, testCallId] ()
+finishTest :: TestEnv -> IO ()
+finishTest env = do
+                  sClose (localSock env)
+                  sClose (remoteSock env)
+
+
+inject :: TestEnv -> BS.ByteString -> IO Int
+inject env msg = sendTo (remoteSock env) msg (localSockAddr env)
+
+handleAll :: TestEnv -> IO TestEnv
+handleAll env = serveOne (testedStack env) >>= \x -> return (env{testedStack = x})
+
+catchOutgoing :: TestEnv -> IO (BS.ByteString, SockAddr)
+catchOutgoing env = recvFrom (remoteSock env) 1500
+
+
+-- |-------------------------------------------------------------
+-- |
+-- | Tests for server functionality
+-- |
+-- |-------------------------------------------------------------
+
+
+incomingRegisterStr = "REGISTER sip:user@host SIP/2.0\r\nFrom: User <sip:user@domain.dom>\r\nTo: User <sip:user@domain.dom>\r\nCall-ID: 123321\r\nVia: SIP/2.0/UDP 127.0.0.1:5060;branch=123123123123\r\n\r\n"
+incomingRegister = BS.pack incomingRegisterStr
+
+testIncomingRegister = do
+                         testEnv <- prepareTest defaultConfig printingHandler
+                         sendCount <- inject testEnv message
+                         updatedEnv <- handleAll testEnv
+                         finishTest updatedEnv
+   where
+     message = incomingRegister
+
+
+testIncomingRegister2 = do
+                         testEnv <- prepareTest defaultConfig simpleResponder
+                         sendCount <- inject testEnv message
+                         updatedEnv <- handleAll testEnv
+                         (resp, to) <- catchOutgoing testEnv
+                         System.IO.putStrLn (BS.unpack resp)
+                         finishTest updatedEnv
+   where
+     message = incomingRegister
+
+
+-- |-------------------------------------------------------------
+-- |
+-- | Tests for client functionality
+-- |
+-- |-------------------------------------------------------------
+
+testResponseHandler resp = unsafePerformIO (Prelude.putStrLn (show resp))
 
 emptyResponseHandler :: ResponseHandler
 emptyResponseHandler res = ()
 
 
-initStack :: Stack -> IO Stack
-initStack stack = do
-              sock <- socket AF_INET Datagram 0
-              bindSocket sock localAddr
-              return (updateTransport (addSocketUDP localAddr sock) stack)
-   where
-     localAddr = SockAddrInet 5657 iNADDR_ANY
+testReqURI = (RawURI (BS.pack "sip") (BS.pack "127.0.0.1") )
 
-start :: Stack -> IO ()
-start stack  = do
-                 initilaizedStack <- initStack stack
-                 serveLoop initilaizedStack
+testOutgoingReq = Request INVITE testReqURI defaultProtoVersion [testFrom, testTo, testCallId] ()
 
 
 testFromURI = (RawURI (BS.pack "sip") (BS.pack "127.0.0.1") )
 testToURI = (RawURI (BS.pack "sip") (BS.pack "127.0.0.1") )
+
+initStack :: Stack -> IO Stack
+initStack stack = do
+              sock <- socket AF_INET Datagram 0
+              bindSocket sock localAddr
+              return (stack{transportLayer=(addSocketUDP localAddr sock (transportLayer stack))})
+   where
+     localAddr = SockAddrInet localPort iNADDR_ANY
+
 
 testSendReqStateless = do
                         readyStack <- initStack (newStack simpleResponder)
@@ -56,7 +152,6 @@ testSendReqStateless = do
 
 
 
-testResponseHandler resp = unsafePerformIO (Prelude.putStrLn (show resp))
 
 testSendReqReceiveResp = do
                           stackA <- initStack (newStack simpleResponder)
