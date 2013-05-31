@@ -4,6 +4,7 @@ import Data.Maybe
 import qualified Data.ByteString.Char8 as BS
 import Data.List
 import Data.Word
+import Control.Monad
 
 data Transport = TCP | UDP | SCTP | TLS | Unknown BS.ByteString deriving (Eq, Ord, Show)
 
@@ -74,6 +75,10 @@ toAddress :: Header -> Maybe SipAddress
 toAddress (AddressHeader addr) = Just addr
 toAddress _ = Nothing
 
+getHeaderVal :: Header -> Maybe BS.ByteString
+getHeaderVal (GenericHeader v) = Just v
+getHeaderVal _ = Nothing
+
 
 data Request a = 
      Request {reqMethod :: RequestMethod, reqURI :: URI, reqVersion :: ProtoVersion, reqHeaders :: [(BS.ByteString, Header)], reqBody :: a } deriving (Show)
@@ -123,16 +128,43 @@ defaultReason 302 = BS.pack "Moved temporary"
 
 
 
-data ClientTranKey = ClientTranKey RequestMethod BS.ByteString deriving (Eq, Ord, Show)
+data ClientTranKey = ClientTranKey {clientTranMethod::RequestMethod, clientTranBranch::BS.ByteString} deriving (Eq, Ord, Show)
 
 getClientTranKey :: (Message a) => a -> Maybe ClientTranKey
 getClientTranKey message = (getTopHeader message (BS.pack "Via")) >>= toVia >>= (Just . viaParams) >>= (getParam (BS.pack "branch")) >>= (Just . ClientTranKey (getMethod message))
 
-data ServerTranKey = ServerTranKey RequestMethod BS.ByteString deriving (Eq, Ord, Show)
+data ServerTranKey = ServerTranKey {serverTranMethod::RequestMethod, serverTranBranch::BS.ByteString} deriving (Eq, Ord, Show)
 
 getServerTranKey :: (Message a) => a -> Maybe ServerTranKey
 getServerTranKey message = (getTopHeader message (BS.pack "Via")) >>= toVia >>= (Just . viaParams) >>= (getParam (BS.pack "branch")) >>= (Just . ServerTranKey (getMethod message))
 
 
+data DialogKey = DialogKey{callId::BS.ByteString, localTag::BS.ByteString, remoteTag::BS.ByteString} deriving (Eq, Ord, Show)
+
+getDialogKeyFromReq :: Request a -> Maybe DialogKey
+getDialogKeyFromReq req = getDialogKey req True
+
+getDialogKeyFromRes :: Response a -> Maybe DialogKey
+getDialogKeyFromRes res = getDialogKey res False
+
+getDialogKey :: (Message a) => a -> Bool -> Maybe DialogKey
+getDialogKey msg reverse = if reverse then (liftM3 DialogKey mbCallId mbToTag mbFromTag) else (liftM3 DialogKey mbCallId mbFromTag mbToTag)
+  where
+    mbCallId = getTopHeader msg (BS.pack "Call-ID") >>= getHeaderVal
+    mbFromTag = getTopHeader msg (BS.pack "From") >>= toAddress >>= (Just . addrParams) >>= (getParam (BS.pack "tag"))
+    mbToTag = getTopHeader msg (BS.pack "To") >>= toAddress >>= (Just . addrParams) >>= (getParam (BS.pack "tag"))
 
 
+data ProxyKey = ProxyKey BS.ByteString
+
+
+isDialogEstablishing :: RequestMethod -> Bool
+isDialogEstablishing INVITE    = True
+isDialogEstablishing SUBSCRIBE = True
+isDialogEstablishing _         = False
+
+isInDialogOnly :: RequestMethod -> Bool
+isInDialogOnly BYE    = True
+isInDialogOnly ACK    = True
+isInDialogOnly NOTIFY = True
+isInDialogOnly _      = False

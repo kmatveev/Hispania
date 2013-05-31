@@ -42,13 +42,13 @@ remotePort = 5698
 simpleResponder :: RequestHandler
 simpleResponder req serverCtx = respond serverCtx response
   where
-    response = respondTo req 200
+    response = createResponseTo req 200
 
 printingHandler :: RequestHandler
-printingHandler req serverCtx stack = do
-                                       System.IO.putStrLn "Received request"
-                                       hFlush stdout
-                                       return stack
+printingHandler req serverCtx session stack = do
+                                               System.IO.putStrLn "Received request"
+                                               hFlush stdout
+                                               return ((), session, stack)
 
 data TestEnv = TestEnv {localSock::Socket, localSockAddr::SockAddr, remoteSock::Socket, remoteSockAddr::SockAddr, testedStack::Stack}
 
@@ -76,14 +76,57 @@ finishTest env = do
                   sClose (remoteSock env)
 
 
-inject :: TestEnv -> BS.ByteString -> IO Int
-inject env msg = sendTo (remoteSock env) msg (localSockAddr env)
+                     
+
+
+inject :: BS.ByteString -> TestEnv -> IO Int
+inject msg env = sendTo (remoteSock env) msg (localSockAddr env)
 
 handleAll :: TestEnv -> IO TestEnv
-handleAll env = serveOne (testedStack env) >>= \x -> return (env{testedStack = x})
+handleAll env = serveOne (testedStack env) >>= \x -> return (env{testedStack = (snd x)})
+
 
 catchOutgoing :: TestEnv -> IO (BS.ByteString, SockAddr)
 catchOutgoing env = recvFrom (remoteSock env) 1500
+
+newtype TestAction a = TestAction{runTest:: TestEnv -> IO (a, TestEnv)}
+
+instance Monad TestAction where
+  return k = TestAction (\env -> return (k, env))
+  p >>= q  = TestAction (\env -> do
+                                  (x, envX) <- (runTest p) env
+                                  (runTest (q x)) envX
+                         )
+
+transform :: (TestEnv -> IO a) -> (TestEnv -> IO (a, TestEnv))
+transform f = \env -> do
+                       v <- f env
+                       return (v, env)
+
+
+
+
+catchOutgoingAction = TestAction (transform catchOutgoing)
+
+injectAction :: BS.ByteString -> TestAction Int
+injectAction = TestAction . transform . inject
+
+finishTestAction = TestAction (\env -> (finishTest env >> return ((),env)))
+
+handleAllAction = TestAction (\env -> (handleAll env >>= \newEnv -> return (newEnv,newEnv)))
+
+logAction :: String -> TestAction ()
+logAction str = TestAction (\env -> (System.IO.putStrLn str) >> return ((), env))
+
+withStack :: StackAction a -> TestAction a
+withStack stackAction = TestAction (\env -> do
+                                             (v, stack) <- runStackAction stackAction (testedStack env)
+                                             let updatedEnv = env{testedStack=stack}
+                                             return (v,updatedEnv)
+                                    )
+
+remotePortAction :: TestAction Word16
+remotePortAction = TestAction (\env -> return ((getPort (remoteSockAddr env)), env))
 
 
 -- |-------------------------------------------------------------
@@ -93,12 +136,12 @@ catchOutgoing env = recvFrom (remoteSock env) 1500
 -- |-------------------------------------------------------------
 
 
-incomingRegisterStr = "REGISTER sip:user@host SIP/2.0\r\nFrom: User <sip:user@domain.dom>\r\nTo: User <sip:user@domain.dom>\r\nCall-ID: 123321\r\nVia: SIP/2.0/UDP 127.0.0.1:5060;branch=123123123123\r\n\r\n"
+incomingRegisterStr = "REGISTER sip:user@host SIP/2.0\r\nFrom: OrigUser <sip:originator@domain.dom>\r\nTo: RecepientUser <sip:recepient@domain.dom>\r\nCall-ID: 123321\r\nVia: SIP/2.0/UDP 127.0.0.1:5060;branch=555123123123123\r\n\r\n"
 incomingRegister = BS.pack incomingRegisterStr
 
 testIncomingRegister = do
                          testEnv <- prepareTest defaultConfig printingHandler
-                         sendCount <- inject testEnv message
+                         sendCount <- inject message testEnv
                          updatedEnv <- handleAll testEnv
                          finishTest updatedEnv
    where
@@ -107,13 +150,36 @@ testIncomingRegister = do
 
 testIncomingRegister2 = do
                          testEnv <- prepareTest defaultConfig simpleResponder
-                         sendCount <- inject testEnv message
+                         sendCount <- inject message testEnv
                          updatedEnv <- handleAll testEnv
                          (resp, to) <- catchOutgoing testEnv
                          System.IO.putStrLn (BS.unpack resp)
                          finishTest updatedEnv
    where
      message = incomingRegister
+
+doubleResponder req serverCtx = runSipAction $ do
+                                                let provisionalResp = createResponseTo req 100
+                                                SipAction $ respond serverCtx provisionalResp
+                                                let finalResp = createResponseTo req 200
+                                                SipAction $ respond serverCtx finalResp
+
+
+testIncomingRegister3 = do
+                         testEnv <- prepareTest defaultConfig doubleResponder
+                         runTest ( do
+                                     sendCount <- injectAction message
+                                     handleAllAction
+                                     (resp, to) <- catchOutgoingAction
+                                     logAction (BS.unpack resp)
+                                     (resp, to) <- catchOutgoingAction 
+                                     logAction (BS.unpack resp)
+                                     finishTestAction
+                                  ) testEnv
+   where
+     message = incomingRegister
+
+
 
 
 -- |-------------------------------------------------------------
@@ -122,10 +188,13 @@ testIncomingRegister2 = do
 -- |
 -- |-------------------------------------------------------------
 
-testResponseHandler resp = unsafePerformIO (Prelude.putStrLn (show resp))
+
 
 emptyResponseHandler :: ResponseHandler
-emptyResponseHandler res = ()
+emptyResponseHandler res clientCtxRef session stack = do
+                                                        System.IO.putStrLn "Received response"
+                                                        hFlush stdout
+                                                        return ((), session, stack)
 
 
 testReqURI = (RawURI (BS.pack "sip") (BS.pack "127.0.0.1") )
@@ -145,23 +214,57 @@ initStack stack = do
      localAddr = SockAddrInet localPort iNADDR_ANY
 
 
-testSendReqStateless = do
-                        readyStack <- initStack (newStack simpleResponder)
-                        stackSent <- (uncurry (sendRequest emptyResponseHandler)) (createRequest INVITE testFromURI testToURI readyStack)
-                        return ()
 
 
 
-
-testSendReqReceiveResp = do
-                          stackA <- initStack (newStack simpleResponder)
-                          let uaCtx = createUAContext localAddr stackA
-                          let (clientCtx, stackC) = createClientContext remoteAddr INVITE testResponseHandler uaCtx
-                          stackD <- sendReq (requestPrototype clientCtx) (clientCtx, stackC)
-                          serveOne stackD
+testSendReqReceiveResp = let handler = runSipAction $ do
+                                                       uaCtx <- SipAction $ createUAContext localAddr printingHandler
+                                                       (clientCtx, requestPrototype) <- SipAction $ createClientContext remoteAddr INVITE emptyResponseHandler uaCtx
+                                                       SipAction $ sendReq requestPrototype clientCtx
+                         in 
+                            do 
+                              stack <- initStack (newStack printingHandler)
+                              let action = inNewSession handler
+                              (unit, stack) <- runStackAction (StackAction action) stack
+                              serveOne stack
   where
      localURI = SipURI False (BS.pack "alice") (BS.empty) (BS.pack "alicehost") (Just (fromIntegral 5060)) []
      localAddr = SipAddress (Just (BS.pack "Alice")) localURI []
      remoteURI = SipURI False (BS.pack "bob") BS.empty (BS.pack "127.0.0.1") (Just (fromIntegral 5060)) []
      remoteAddr = SipAddress (Just (BS.pack "Bob")) remoteURI []
+
+
+
+testOutgInvite = do
+                  testEnv <- prepareTest defaultConfig doubleResponder
+                  runTest ( do
+                              remotePort <- remotePortAction
+                              logAction ("remote port is: " ++ (show remotePort))
+                              withStack (StackAction (inNewSession (sender remotePort)))
+                              logAction "something sent"
+                              (req, to) <- catchOutgoingAction
+                              logAction (BS.unpack req)
+                              let response = makeResponse req
+                              logAction (BS.unpack response)
+                              sendCount <- injectAction response
+                              handleAllAction
+                              logAction "response injected"
+                              finishTestAction
+                           ) testEnv
+
+   where
+     makeResponse req = let reqLines = BS.splitWith (\c -> (c == '\n')) req in
+                        let respLines = (BS.pack "SIP/2.0 200 OK\r") : (Prelude.drop 1 reqLines) in
+                        intercalate (BS.pack "\n") respLines
+     sender remotePort = runSipAction $ do
+                              uaCtx <- SipAction $ createUAContext localAddr printingHandler
+                              (clientCtx, requestPrototype) <- SipAction $ createClientContext (remoteAddr remotePort) INVITE emptyResponseHandler uaCtx
+                              SipAction $ sendReq requestPrototype clientCtx
+     localURI = SipURI False (BS.pack "alice") (BS.empty) (BS.pack "alicehost") (Just (fromIntegral 5060)) []
+     localAddr = SipAddress (Just (BS.pack "Alice")) localURI []
+     remoteURI remotePort = SipURI False (BS.pack "bob") BS.empty (BS.pack "127.0.0.1") (Just remotePort) []
+     remoteAddr remotePort = SipAddress (Just (BS.pack "Bob")) (remoteURI remotePort) []
+
+
+
 
