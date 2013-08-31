@@ -75,9 +75,9 @@ toAddress :: Header -> Maybe SipAddress
 toAddress (AddressHeader addr) = Just addr
 toAddress _ = Nothing
 
-getHeaderVal :: Header -> Maybe BS.ByteString
-getHeaderVal (GenericHeader v) = Just v
-getHeaderVal _ = Nothing
+getHeaderVal :: Header -> BS.ByteString
+getHeaderVal (GenericHeader v) = v
+getHeaderVal _ = BS.pack "no_val"
 
 
 data Request a = 
@@ -150,7 +150,7 @@ getDialogKeyFromRes res = getDialogKey res False
 getDialogKey :: (Message a) => a -> Bool -> Maybe DialogKey
 getDialogKey msg reverse = if reverse then (liftM3 DialogKey mbCallId mbToTag mbFromTag) else (liftM3 DialogKey mbCallId mbFromTag mbToTag)
   where
-    mbCallId = getTopHeader msg (BS.pack "Call-ID") >>= getHeaderVal
+    mbCallId = getTopHeader msg (BS.pack "Call-ID") >>= Just . getHeaderVal
     mbFromTag = getTopHeader msg (BS.pack "From") >>= toAddress >>= (Just . addrParams) >>= (getParam (BS.pack "tag"))
     mbToTag = getTopHeader msg (BS.pack "To") >>= toAddress >>= (Just . addrParams) >>= (getParam (BS.pack "tag"))
 

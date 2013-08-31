@@ -1,9 +1,11 @@
 module Hispania.Stack ( 
   Stack(..), newStack, maybeUpdateTransport,
-  RequestHandler, ResponseHandler, ServerContext, ClientContext(..), serveOne, serveLoop,
+  RequestHandler, ResponseHandler, UARequestHandler,
+  ServerContext, ClientContext(..), serveOne, serveLoop,
   StackAction(..),
   inNewSession,
   SipAction(..),
+  ioSipAction,
   respond, createResponseTo,
   createRequestPure, sendReq, createUAContext, createClientContext
 ) where
@@ -30,6 +32,7 @@ import System.IO
 
 import Control.Monad.State
 import Control.Monad.Reader
+import Control.Monad.Error
 
 echoPort = 9900
 
@@ -66,7 +69,7 @@ newStack :: RequestHandler -> Stack
 newStack reqHandler = Stack clearTransportLayer reqHandler 0 Map.empty Map.empty Map.empty Map.empty
 
 
-data Dialog = Dialog DialogState UAContext
+data Dialog = Dialog {dialogState::DialogState}
 
 data DialogState = DSEarly | DSEstablished | DSTerminated
 
@@ -102,20 +105,18 @@ type ContextRef = Maybe (Either ServerCtxRef ClientCtxRef)
 
 newtype UACtxRef = UACtxRef String deriving (Eq, Ord)
 
-newtype DialogRef = DialogRef String deriving (Eq, Ord)
-
 
 
 data ClientContext = ClientContext {remoteAddr::SipAddress, clientUA::UACtxRef, responseHandler::ResponseHandler, clientTranKey::ClientTranKey}
 
-data ServerContext = ServerContext {servingDirection::Direction, servingTransport::Transport, serverTranKey::ServerTranKey}
+data ServerContext = ServerContext {servingDirection::Direction, servingTransport::Transport, serverTranKey::ServerTranKey, servingUa:: Maybe UACtxRef}
 
 
 
 data UAContext = UAContext {
                      localAddr::SipAddress, 
                      callIdVal::BS.ByteString, 
-                     uaRequestHandler::RequestHandler, 
+                     uaRequestHandler::UARequestHandler, 
                      initialContext::ContextRef, 
                      terminatingContext:: ContextRef
                    }
@@ -146,13 +147,13 @@ type ServerCtxStore = Map.Map ServerCtxRef ServerContext
 
 type ClientCtxStore = Map.Map ClientCtxRef ClientContext
 
-type DialogStore = Map.Map DialogRef Dialog
-
 type ServerTranStore = Map.Map ServerTranKey ServerTransaction
 
 type ClientTranStore = Map.Map ClientTranKey ClientTransaction
 
 type UACtxStore = Map.Map UACtxRef UAContext
+
+type DialogStore = Map.Map DialogKey Dialog
 
 type ErrorHandler = Stack -> IO Stack
 
@@ -189,13 +190,13 @@ updateClientTran ref tran session = session{clientTranStore = (Map.insert ref tr
 removeClientTran :: ClientTranKey -> SipSession -> SipSession
 removeClientTran ref session = session{clientTranStore = (Map.delete ref (clientTranStore session))}
 
-getDialog :: DialogRef -> SipSession -> Maybe Dialog
+getDialog :: DialogKey -> SipSession -> Maybe Dialog
 getDialog ref session = Map.lookup ref (dialogStore session)
 
-updateDialog :: DialogRef -> Dialog -> SipSession -> SipSession
+updateDialog :: DialogKey -> Dialog -> SipSession -> SipSession
 updateDialog ref dialog session = session{dialogStore = (Map.insert ref dialog (dialogStore session))}
 
-removeDialog :: DialogRef -> SipSession -> SipSession
+removeDialog :: DialogKey -> SipSession -> SipSession
 removeDialog ref session = session{dialogStore = (Map.delete ref (dialogStore session))}
 
 getUACtx :: UACtxRef -> SipSession -> Maybe UAContext
@@ -228,7 +229,11 @@ newSession = SipSession Map.empty Map.empty Map.empty Map.empty Map.empty Map.em
 
 type SessionTask a = SipSession -> Stack -> IO (a, SipSession, Stack)
 
+emptySessionTask :: SessionTask ()
+emptySessionTask session stack = return ((), session, stack)
 
+
+type PureSessionTask a = SipSession -> Stack -> (a, SipSession, Stack)
 
 
 updateSession :: SipSession -> Stack -> Stack
@@ -239,11 +244,10 @@ updateSession session stack = stack{clientTranMap = updatedClientTranMap, server
         serverTranKeys = (Map.keys . serverTranStore) session
         updatedServerTranMap = foldl (\map key -> Map.insert key session map) (serverTranMap stack) serverTranKeys
 
+
 {-
 updateSessionTask :: SessionTask
 updateSessionTask updatedSession stack = let updatedStack = (updateSession updatedSession stack) 
-                                         in (return (updatedSession, updatedStack))
-
 
 setErrorHandler :: ErrorHandler -> SessionTask
 setErrorHandler newErrorHandler session = let updatedSession = session{errorHandler = newErrorHandler}
@@ -267,10 +271,12 @@ serveOne origStack = do
 
 
 
-inNewSession :: SessionTask a -> StackTask a
-inNewSession sessionTask = \stack -> do
-                                        (val, updatedSession, updatedStack) <- sessionTask newSession stack
-                                        return (val, updatedStack)
+inNewSession :: SipAction a -> StackAction a
+inNewSession sipAction = StackAction (\stack -> 
+   do
+     (val, updatedSession, updatedStack) <- runSipAction sipAction newSession stack
+     return (val, updatedStack)
+   )
 
 
 handle :: BS.ByteString ->  Direction -> Transport -> StackTask ()
@@ -288,29 +294,35 @@ createSessionForServer serverTranKey serverTran serverCtxRef serverCtx = (\sess 
 handleRequest :: Request () -> Direction -> Transport -> StackTask ()
 handleRequest request direction transport stack = 
      case (getServerTranKey request) of
-       Nothing            -> return ((), stack)
-       Just serverTranKey -> case (Map.lookup serverTranKey (serverTranMap stack)) of 
-                               Just session -> case (getServerTran serverTranKey session) of
-                                                  Nothing -> return ((), stack)
-                                                  Just serverTran -> serverTranSMProcessReq serverTran request stack
-                               Nothing      -> case (getDialogKeyFromReq request) of
-                                                  Just dialogKey -> case (Map.lookup dialogKey (dialogMap stack)) of
-                                                                      Nothing     -> return ((), stack)
-                                                                      Just session -> return ((), stack)
-                                                  Nothing ->  do
-                                                                (unit, aSession, aStack) <- task
-                                                                return (unit, aStack)
-                                                              where
-                                                                  task = reqHandler request serverCtxRef updatedSession (updateStack updatedSession stack)
-                                                                  serverCtx = ServerContext direction transport serverTranKey
-                                                                  reqHandler = initialRequestHandler stack
-                                                                  updatedSession = createSessionForServer serverTranKey createdServerTran serverCtxRef serverCtx
-                                                                  updateStack sess st = st{serverTranMap = (Map.insert serverTranKey sess (serverTranMap st))}
-                                                where
-                                                    serverCtxRef = generateServerCtxRef serverTranKey
-                                                    createdServerTran = case (reqMethod request) of
-                                                                          INVITE -> InviteServerTransaction ISInitial
-                                                                          _      -> NonInviteServerTransaction NISInitial
+       Nothing -> return ((), stack)
+       Just serverTranKey -> 
+          case (Map.lookup serverTranKey (serverTranMap stack)) of 
+            Just session -> 
+               case (getServerTran serverTranKey session) of
+                  Nothing -> return ((), stack)
+                  Just serverTran -> serverTranSMProcessReq serverTran request stack
+            Nothing -> 
+               case (getDialogKeyFromReq request) of
+                 Just dialogKey -> 
+                   case (Map.lookup dialogKey (dialogMap stack)) of
+                     Nothing     -> return ((), stack)
+                     Just session -> case (getDialog dialogKey session) of
+                                       Nothing -> return ((), stack)
+                                       Just dialog -> dialogSMProcessIncomingReq dialog request session stack
+                 Nothing ->  do
+                               (unit, aSession, aStack) <- task
+                               return (unit, aStack)
+                             where
+                               task = runSipAction (reqHandler request serverCtxRef) updatedSession (updateStack updatedSession stack)
+                               serverCtx = ServerContext direction transport serverTranKey Nothing
+                               reqHandler = initialRequestHandler stack
+                               updatedSession = createSessionForServer serverTranKey createdServerTran serverCtxRef serverCtx
+                               updateStack sess st = st{serverTranMap = (Map.insert serverTranKey sess (serverTranMap st))}
+               where
+                 serverCtxRef = generateServerCtxRef serverTranKey
+                 createdServerTran = case (reqMethod request) of
+                                       INVITE -> InviteServerTransaction ISInitial
+                                       _      -> NonInviteServerTransaction NISInitial
 
 
 
@@ -334,23 +346,34 @@ serverTranSMProcessReq (InviteServerTransaction state ) req stack =
       ISTerminated -> putStrLn "retransmit" >> return ((), stack)
 
 
+dialogSMProcessIncomingReq :: Dialog -> Request () -> SipSession -> StackTask ()
+-- dialogSMProcessIncomingReq (DSTerminated _) request session stack = return ((), stack)
+dialogSMProcessIncomingReq dialog request session stack = return ((), stack)
+
+
 
 handleResponse :: Response () -> StackTask ()
 handleResponse res stack = 
     case (getClientTranKey res) of
        Nothing      -> return ((), stack)
-       Just tranKey -> case (Map.lookup tranKey (clientTranMap stack)) of
-                         Nothing      -> return ((), stack)
-                         Just session -> let clientCtxRef = generateClientCtxRef tranKey in
-                                         case (getClientTran tranKey session) of
-                                           Nothing         -> return ((), stack)
-                                           Just clientTran -> case (clientTranSMProcessRes clientTran res) of
-                                                                (newClientTran, Ignore)              -> return ((), stack)
-                                                                (newClientTran, HandleToApplication) -> case (getClientCtx clientCtxRef session) of
-                                                                                                          Nothing        -> return ((), stack)
-                                                                                                          Just clientCtx -> do
-                                                                                                                              (unit, updatedSession, updatedStack) <- (responseHandler clientCtx) res clientCtxRef session stack
-                                                                                                                              return (unit, updatedStack)
+       Just tranKey -> 
+          case (Map.lookup tranKey (clientTranMap stack)) of
+             Nothing      -> return ((), stack)
+             Just session -> 
+               case (getClientTran tranKey session) of
+                  Nothing         -> return ((), stack)
+                  Just clientTran -> 
+                     case (clientTranSMProcessRes clientTran res) of
+                       (newClientTran, Ignore)              -> return ((), stack)
+                       (newClientTran, HandleToApplication) -> 
+                          let clientCtxRef = generateClientCtxRef tranKey in
+                          case (getClientCtx clientCtxRef session) of
+                             Nothing        -> return ((), stack)
+                             Just clientCtx -> 
+                                do
+                                 (unit, updatedSession, updatedStack) <- runSipAction ((responseHandler clientCtx) res clientCtxRef) session stack
+                                 return (unit, updatedStack)
+
 
 data IncomingResponseAction = HandleToApplication | Ignore
 
@@ -374,9 +397,14 @@ clientTranSMProcessRes (InviteClientTransaction state ) res =
 
 
 
-type RequestHandler = Request () -> ServerCtxRef -> SessionTask ()
+type RequestHandler = Request () -> ServerCtxRef -> SipAction ()
 
-type ResponseHandler = Response () -> ClientCtxRef -> SessionTask ()
+type UARequestHandler = Request () -> ServerCtxRef -> UACtxRef -> SipAction ()
+
+emptyUARequestHandler :: UARequestHandler
+emptyUARequestHandler request serverCtxRef uaCtxRef = SipAction emptySessionTask
+
+type ResponseHandler = Response () -> ClientCtxRef -> SipAction ()
 
 
 newtype SipAction a = SipAction{runSipAction :: SessionTask a}
@@ -387,7 +415,41 @@ instance Monad SipAction where
                                              (v, sessV, stackV) <- (runSipAction k) sess stack
                                              (runSipAction (b v)) sessV stackV
                              )
+
+ioSipAction :: IO a -> SipAction a
+ioSipAction ioAction = SipAction (\session stack -> do
+                                                     ioResult <- ioAction
+                                                     return (ioResult, session, stack)
+                                  )
   
+newtype PureSipAction a = PureSipAction{runPureSipAction :: PureSessionTask a}
+
+instance Monad PureSipAction where
+  return x = PureSipAction (\sess stack -> (x, sess, stack))
+  k >>= b  = PureSipAction (\sess stack -> let (v, sessV, stackV) = (runPureSipAction k) sess stack 
+                                           in (runPureSipAction (b v)) sessV stackV
+                            )
+
+fromPureSipAction :: PureSipAction a -> SipAction a
+fromPureSipAction pureAction = SipAction (\sess stack -> return (runPureSipAction pureAction sess stack))
+
+fromErrorneousPureSipAction :: ErrorT e PureSipAction a -> ErrorT e SipAction a
+fromErrorneousPureSipAction errorneousPure = ErrorT (SipAction (\session stack -> return (runPureSipAction (runErrorT errorneousPure) session stack)))
+
+
+fromStackAction :: StackAction a -> SipAction a
+fromStackAction stackAction = SipAction(\session stack -> do 
+                                                           (result, updatedStack) <- runStackAction stackAction stack 
+                                                           return (result, session, updatedStack)
+                                        )
+
+generateVal :: PureSipAction [Word]
+generateVal = PureSipAction (\session stack -> let (generated, newGenVal) = nextVal (generatorVal stack)
+                                               in (generated, session, (updateGenerator newGenVal stack))
+                             )
+
+updateSessionPureAction :: (SipSession -> SipSession) -> PureSipAction ()
+updateSessionPureAction f = PureSipAction (\sess stack -> let updatedSession = f sess in ((), updatedSession, (updateSession updatedSession stack)))
 
 
 updateAndPerform :: (SipSession, StackTask a) -> Stack -> IO (a, SipSession, Stack)
@@ -395,31 +457,41 @@ updateAndPerform (session, task) stack = do
                                            (val, updatedStack) <- task (updateSession session stack)
                                            return (val, session, updatedStack)
 
+readSession :: PureSipAction SipSession
+readSession = PureSipAction (\session stack -> (session, session, stack))
 
-respond :: ServerCtxRef -> Response () -> SessionTask ()
-respond ref resp session = case (sessionAction session) of
-                            Nothing -> \stack -> return ((), session, stack)
-                            (Just v)  -> updateAndPerform v
+getStackAction :: SipAction Stack
+getStackAction = SipAction (\ session stack -> return (stack, session, stack))
 
+respond :: ServerCtxRef -> Response () -> ErrorT String SipAction ()
+respond ref resp = do
+                     lowLevelTask <- fromErrorneousPureSipAction sessionAction
+                     lift (fromStackAction lowLevelTask)
     where
-       sessionAction :: SipSession -> Maybe (SipSession, (Stack -> IO ((), Stack)))
-       sessionAction = runReaderT $ do
-                                      serverCtx <- ReaderT $ getServerCtx ref
-                                      let transport = servingTransport serverCtx
-                                      let respDirection = calcDirectionForResponse transport (servingDirection serverCtx)
-                                      let sendTask s = do
-                                                        mbUpdatedTransportLayer <- sendResponseTo resp respDirection transport (transportLayer s)
-                                                        return ((), (maybeUpdateTransport mbUpdatedTransportLayer s))
-                                      let tranKey = serverTranKey serverCtx
-                                      serverTran <- ReaderT $ getServerTran tranKey
-                                      let (mbTranUpdate, responseCommand) = serverTranSMProcessRes serverTran resp
-                                      let serverTranAction = maybe id (\trn -> if (isTerminatedState trn) then (removeServerTran tranKey) else (updateServerTran tranKey trn)) mbTranUpdate
-                                      updatedSession <- reader serverTranAction
-                                      let responseAction = case responseCommand of
-                                                             SendResponseOnce -> sendTask
-                                                             ResponseError    -> return . ((,) ())
-                                                             SkipResponse     -> return . ((,) ())
-                                      return (updatedSession, responseAction)
+       updateServerTranAction :: Maybe ServerTransaction -> ServerTranKey -> SipSession -> SipSession 
+       updateServerTranAction mbServerTran tranKey = maybe id (\trn -> if (isTerminatedState trn) then (removeServerTran tranKey) else (updateServerTran tranKey trn)) mbServerTran
+       
+       sessionAction :: ErrorT String PureSipAction (StackAction ())
+       sessionAction = 
+           do
+             serverCtx <- ((lift readSession) >>= ((maybe (throwError "Invalid argument: ServerContext not found by reference") return) . (getServerCtx ref)))
+             let tranKey = serverTranKey serverCtx
+             serverTran <- ((lift readSession) >>= ((maybe (throwError "Internal error: ServerTransaction not found ") return) . (getServerTran tranKey)))
+             let (mbTranUpdate, responseCommand) = serverTranSMProcessRes serverTran resp
+             case responseCommand of
+                     SendResponseOnce -> do
+                                           uaCtx <- getOrCreateUACtx serverCtx ref resp
+                                           (updateUAServer uaCtx resp)
+                                           lift ((updateSessionPureAction (updateServerTranAction mbTranUpdate tranKey)))
+                                           return (StackAction sendTask)
+                                         where
+                                           transport = servingTransport serverCtx
+                                           respDirection = calcDirectionForResponse transport (servingDirection serverCtx)
+                                           sendTask s = do
+                                                          mbUpdatedTransportLayer <- sendResponseTo resp respDirection transport (transportLayer s)
+                                                          return ((), (maybeUpdateTransport mbUpdatedTransportLayer s))
+                     ResponseError    -> throwError "Illegal state: response was already sent"
+
 
 
 
@@ -444,7 +516,31 @@ serverTranSMProcessRes (InviteServerTransaction state) res =
       ISTerminated -> ( Nothing, ResponseError )
 
 
+getOrCreateUACtx :: ServerContext -> ServerCtxRef -> Response () -> ErrorT String PureSipAction UAContext
+getOrCreateUACtx serverCtx serverCtxRef response = 
+     case (servingUa serverCtx) of
+        Nothing ->   do
+                      (uaCtx, uaCtxRef) <- createUAContextForOutgoing response
+                      let updatedServerCtx = serverCtx{servingUa = (Just uaCtxRef)}
+                      lift (updateSessionPureAction ((updateServerCtx serverCtxRef updatedServerCtx) . (updateUACtx uaCtxRef uaCtx)))
+                      return uaCtx
+        Just uaCtxRef -> ErrorT (PureSipAction (\sess stack -> ((maybe (Left "UAContext not found") Right (getUACtx uaCtxRef sess)), sess, stack)))
 
+createUAContextForOutgoing :: Response () -> ErrorT String PureSipAction (UAContext, UACtxRef)
+createUAContextForOutgoing response =
+   do
+    localAddress <- maybe (throwError "Response doesn't have 'To' header") return (getTopHeader response (BS.pack "To") >>= toAddress)
+    callId       <- maybe (throwError "Response doesn't have 'Call-ID' header") return ((getTopHeader response (BS.pack "Call-ID")) >>= (Just . getHeaderVal))
+    localTagTmp  <- lift generateVal
+    let updatedLocal = addAddressParam (BS.pack "tag") (packThem localTagTmp) localAddress
+    let uaCtxRef = generateUACtxRef (BS.unpack (packThem localTagTmp)) (BS.unpack callId)
+    let uaCtx = UAContext updatedLocal callId emptyUARequestHandler Nothing Nothing
+    lift (updateSessionPureAction (updateUACtx uaCtxRef uaCtx))
+    return (uaCtx, uaCtxRef)
+
+-- placeholder
+updateUAServer :: UAContext -> Response () -> ErrorT String PureSipAction ()
+updateUAServer uaCtx resp = return ()
 
 calcDirectionForResponse :: Transport -> Direction -> Direction
 calcDirectionForResponse TCP reqDirection = reverseDirection reqDirection
@@ -463,12 +559,6 @@ createResponseTo req status = Response defaultProtoVersion status (defaultReason
      shouldCopy name = (name == "Via") || (name == "From") || (name == "CSeq") || (name == "To") || (name == "Call-ID")
      copyFromRequest = filter (shouldCopy . BS.unpack . fst)
    
-
-
-
-
-
-
 
 
 
@@ -523,26 +613,31 @@ createRequestPure method from to stack = (Request method to defaultProtoVersion 
      headers   = callIdHdr : fromHdr : cseqHdr : []
 
 
-createUAContextPure:: SipAddress -> RequestHandler -> SipSession -> Stack -> (UACtxRef, SipSession, Stack)
-createUAContextPure local reqH session stack = (uaCtxRef, updatedSession, updatedStack)
-  where
-     ((callIdTmp, localTagTmp), newGenVal) = runState ( let stateGen = state nextVal in liftM2 (,) stateGen stateGen )  (generatorVal stack)    
-     updatedLocal = addAddressParam (BS.pack "tag") (packThem localTagTmp) local
-     uaCtxRef = generateUACtxRef (BS.unpack (packThem localTagTmp)) (BS.unpack (packThem callIdTmp))
-     uaCtx = UAContext updatedLocal (packThem callIdTmp) reqH Nothing Nothing
-     updatedSession = updateUACtx uaCtxRef uaCtx session
-     updatedStack = ((updateGenerator newGenVal) . (updateSession updatedSession)) stack
+createUAContextPure:: SipAddress -> UARequestHandler -> PureSipAction UACtxRef
+createUAContextPure local reqH = PureSipAction createUACtx
+     where
+        createUACtx session stack = (uaCtxRef, updatedSession, updatedStack)
+           where
+            ((callIdTmp, localTagTmp), newGenVal) = runState ( let stateGen = state nextVal in liftM2 (,) stateGen stateGen )  (generatorVal stack)    
+            updatedLocal = addAddressParam (BS.pack "tag") (packThem localTagTmp) local
+            uaCtxRef = generateUACtxRef (BS.unpack (packThem localTagTmp)) (BS.unpack (packThem callIdTmp))
+            uaCtx = UAContext updatedLocal (packThem callIdTmp) reqH Nothing Nothing
+            updatedSession = updateUACtx uaCtxRef uaCtx session
+            updatedStack = ((updateGenerator newGenVal) . (updateSession updatedSession)) stack
 
 
-createUAContext:: SipAddress -> RequestHandler -> SessionTask UACtxRef
-createUAContext local reqH session stack = return (createUAContextPure local reqH session stack)
+
+createUAContext:: SipAddress -> UARequestHandler -> SipAction UACtxRef
+createUAContext local reqH = fromPureSipAction (createUAContextPure local reqH)
 
 
-createClientContextPure:: SipAddress -> RequestMethod -> ResponseHandler -> UACtxRef -> SipSession -> Stack -> Maybe ((ClientCtxRef, Request ()), SipSession, Stack)
-createClientContextPure remote method respHandler uaRef session stack = 
+createClientContextPure:: SipAddress -> RequestMethod -> ResponseHandler -> UACtxRef -> ErrorT String PureSipAction (ClientCtxRef, Request ())
+createClientContextPure remote method respHandler uaRef = ErrorT (PureSipAction createClientCtx)
+   where
+     createClientCtx session stack =
           case (getUACtx uaRef session) of
-              Nothing -> Nothing
-              Just ua -> Just ((clientCtxRef,request), updatedSession, updatedStack)
+              Nothing -> (Left "UAContext not found by reference", session, stack)
+              Just ua -> (Right(clientCtxRef,request), updatedSession, updatedStack)
                            where
                              callIdHdr  = ((BS.pack "Call-ID") , GenericHeader (callIdVal ua))
                              fromHdr    = ((BS.pack "From")    , AddressHeader (localAddr ua))
@@ -559,8 +654,8 @@ createClientContextPure remote method respHandler uaRef session stack =
                              updatedSession = updateClientCtx clientCtxRef clientCtx session
                              updatedStack = ((updateGenerator newGenVal) . (updateSession updatedSession)) stack
 
-createClientContext:: SipAddress -> RequestMethod -> ResponseHandler -> UACtxRef -> SessionTask (ClientCtxRef, Request ())
-createClientContext remote method respHandler uaRef session stack = maybe (fail "error") return (createClientContextPure remote method respHandler uaRef session stack)
+createClientContext:: SipAddress -> RequestMethod -> ResponseHandler -> UACtxRef -> ErrorT String SipAction (ClientCtxRef, Request ())
+createClientContext remote method respHandler uaRef = fromErrorneousPureSipAction (createClientContextPure remote method respHandler uaRef)
 
 
 initClientTran :: Request a -> ClientTransaction
@@ -571,8 +666,8 @@ initClientTran req =
 
 
 
-sendReq :: Request () -> ClientCtxRef -> SessionTask ()
-sendReq req clientRef session stack = 
+sendReq :: Request () -> ClientCtxRef -> SipAction ()
+sendReq req clientRef = SipAction (\session stack ->
    case (getClientCtx clientRef session) of
      Nothing        -> return ((), session, stack)
      Just clientCtx -> updateAndPerform (updatedSession, sendReqTask) stack
@@ -593,3 +688,4 @@ sendReq req clientRef session stack =
 
                                                     let updatedStack = maybeUpdateTransport mbUpdatedTransportLayer stack
                                                     return ((), updatedStack)
+                       )

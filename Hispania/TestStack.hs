@@ -19,6 +19,8 @@ import qualified Data.Map as Map
 import System.IO.Unsafe
 import System.IO
 
+import Control.Monad.Error
+
 -- |-------------------------------------------------------------
 -- |
 -- | Common part: configuration
@@ -40,15 +42,28 @@ remotePort = 5698
 -- |-------------------------------------------------------------
 
 simpleResponder :: RequestHandler
-simpleResponder req serverCtx = respond serverCtx response
+simpleResponder req serverCtx = 
+          do 
+            runErrorT (respond serverCtx response)
+            -- ignore both possible error and result, just return unit
+            return ()
   where
     response = createResponseTo req 200
 
 printingHandler :: RequestHandler
-printingHandler req serverCtx session stack = do
+printingHandler req serverCtx = ioSipAction ( do
                                                System.IO.putStrLn "Received request"
                                                hFlush stdout
-                                               return ((), session, stack)
+                                               return ()
+                                            )
+
+uaPrintingHandler :: UARequestHandler
+uaPrintingHandler req serverCtx uaCtx = ioSipAction ( do
+                                                        System.IO.putStrLn "Received request"
+                                                        hFlush stdout
+                                                        return ()
+                                                     )
+
 
 data TestEnv = TestEnv {localSock::Socket, localSockAddr::SockAddr, remoteSock::Socket, remoteSockAddr::SockAddr, testedStack::Stack}
 
@@ -158,11 +173,12 @@ testIncomingRegister2 = do
    where
      message = incomingRegister
 
-doubleResponder req serverCtx = runSipAction $ do
-                                                let provisionalResp = createResponseTo req 100
-                                                SipAction $ respond serverCtx provisionalResp
-                                                let finalResp = createResponseTo req 200
-                                                SipAction $ respond serverCtx finalResp
+doubleResponder req serverCtx = do
+                                  let provisionalResp = createResponseTo req 100
+                                  runErrorT (respond serverCtx provisionalResp)
+                                  let finalResp = createResponseTo req 200
+                                  runErrorT (respond serverCtx finalResp)
+                                  return ()
 
 
 testIncomingRegister3 = do
@@ -191,10 +207,11 @@ testIncomingRegister3 = do
 
 
 emptyResponseHandler :: ResponseHandler
-emptyResponseHandler res clientCtxRef session stack = do
+emptyResponseHandler res clientCtxRef = ioSipAction (do
                                                         System.IO.putStrLn "Received response"
                                                         hFlush stdout
-                                                        return ((), session, stack)
+                                                        return ()
+                                                     )
 
 
 testReqURI = (RawURI (BS.pack "sip") (BS.pack "127.0.0.1") )
@@ -217,15 +234,16 @@ initStack stack = do
 
 
 
-testSendReqReceiveResp = let handler = runSipAction $ do
-                                                       uaCtx <- SipAction $ createUAContext localAddr printingHandler
-                                                       (clientCtx, requestPrototype) <- SipAction $ createClientContext remoteAddr INVITE emptyResponseHandler uaCtx
-                                                       SipAction $ sendReq requestPrototype clientCtx
+testSendReqReceiveResp = let handler = do
+                                         uaCtx <- createUAContext localAddr uaPrintingHandler
+                                         clientCtxResult <- runErrorT (createClientContext remoteAddr INVITE emptyResponseHandler uaCtx)
+                                         case clientCtxResult of
+                                            Left error -> ioSipAction (System.IO.putStrLn error)
+                                            Right (clientCtx, requestPrototype) -> sendReq requestPrototype clientCtx
                          in 
                             do 
                               stack <- initStack (newStack printingHandler)
-                              let action = inNewSession handler
-                              (unit, stack) <- runStackAction (StackAction action) stack
+                              (unit, stack) <- runStackAction (inNewSession handler) stack
                               serveOne stack
   where
      localURI = SipURI False (BS.pack "alice") (BS.empty) (BS.pack "alicehost") (Just (fromIntegral 5060)) []
@@ -240,7 +258,7 @@ testOutgInvite = do
                   runTest ( do
                               remotePort <- remotePortAction
                               logAction ("remote port is: " ++ (show remotePort))
-                              withStack (StackAction (inNewSession (sender remotePort)))
+                              withStack (inNewSession (sender remotePort))
                               logAction "something sent"
                               (req, to) <- catchOutgoingAction
                               logAction (BS.unpack req)
@@ -256,10 +274,12 @@ testOutgInvite = do
      makeResponse req = let reqLines = BS.splitWith (\c -> (c == '\n')) req in
                         let respLines = (BS.pack "SIP/2.0 200 OK\r") : (Prelude.drop 1 reqLines) in
                         intercalate (BS.pack "\n") respLines
-     sender remotePort = runSipAction $ do
-                              uaCtx <- SipAction $ createUAContext localAddr printingHandler
-                              (clientCtx, requestPrototype) <- SipAction $ createClientContext (remoteAddr remotePort) INVITE emptyResponseHandler uaCtx
-                              SipAction $ sendReq requestPrototype clientCtx
+     sender remotePort = do
+                           uaCtx <- createUAContext localAddr uaPrintingHandler
+                           clientCtxResult <- runErrorT (createClientContext (remoteAddr remotePort) INVITE emptyResponseHandler uaCtx)
+                           case clientCtxResult of
+                              Left error -> ioSipAction (System.IO.putStrLn error)
+                              Right (clientCtx, requestPrototype) -> sendReq requestPrototype clientCtx
      localURI = SipURI False (BS.pack "alice") (BS.empty) (BS.pack "alicehost") (Just (fromIntegral 5060)) []
      localAddr = SipAddress (Just (BS.pack "Alice")) localURI []
      remoteURI remotePort = SipURI False (BS.pack "bob") BS.empty (BS.pack "127.0.0.1") (Just remotePort) []
